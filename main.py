@@ -115,6 +115,11 @@ class Drone:
                 self.trajIndex += 1
                 self.nextPoint = self.trajectory[self.trajIndex+1,:].reshape(3,1)
 
+def attack():
+    pass
+
+def smsf():
+    pass
 
 def simulation():
     dt = 0.001
