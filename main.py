@@ -8,34 +8,46 @@ def hat(v):
                      [v[2], 0, -v[0]],
                      [-v[1], v[0], 0]])
 
-# --- Generate smiley face trajectory components ---
-def smiley_parts(z=10, center=(0,0), radius=10, n_points=200):
-    cx, cy = center
+# --- Digit pattern generator ---
+def digit_pattern(digit, z=10, scale=1.0, offset=(0,0)):
+    ox, oy = offset
+    if digit == 1:
+        pts = np.array([[ox, oy+i*scale, z] for i in range(10)])
+    elif digit == 2:
+        pts = np.array([[ox+i*scale, oy+9*scale, z] for i in range(4)] +
+                       [[ox+3*scale, oy+9*scale-j*scale, z] for j in range(5)] +
+                       [[ox+2-j*scale, oy, z] for j in range(4)])
+    elif digit == 3:
+        pts = np.array([[ox+i*scale, oy+9*scale, z] for i in range(4)] +
+                       [[ox+3*scale, oy+5*scale, z]]*2 +
+                       [[ox+3*scale, oy+j*scale, z] for j in range(5)] +
+                       [[ox+i*scale, oy, z] for i in range(4)])
+    elif digit == 4:
+        pts = np.array([[ox, oy+9*scale-j*scale, z] for j in range(5)] +
+                       [[ox+i*scale, oy+5*scale, z] for i in range(4)] +
+                       [[ox+3*scale, oy+9*scale-j*scale, z] for j in range(10)])
+    elif digit == 5:
+        pts = np.array([[ox+i*scale, oy+9*scale, z] for i in range(4)] +
+                       [[ox, oy+8*scale-j*scale, z] for j in range(5)] +
+                       [[ox+i*scale, oy+4*scale, z] for i in range(4)] +
+                       [[ox+3*scale, oy+3*scale-j*scale, z] for j in range(4)] +
+                       [[ox+i*scale, oy, z] for i in range(4)])
+    else:
+        raise ValueError("Digit not supported")
 
-    # Left eye
-    eye_r = radius * 0.1
-    eye_offset_x = -radius*0.3
-    eye_offset_y = radius*0.3
-    theta_eye = np.linspace(0, 2*np.pi, n_points//10)
-    left_eye = np.vstack((cx + eye_offset_x + eye_r*np.cos(theta_eye),
-                          cy + eye_offset_y + eye_r*np.sin(theta_eye),
-                          np.ones_like(theta_eye)*z)).T
+    # Take exactly 10 points (since we have 10 drones)
+    idx = np.linspace(0, len(pts)-1, 10, dtype=int)
+    return pts[idx]
 
-    # Right eye
-    right_eye = np.vstack((cx + radius*0.3 + eye_r*np.cos(theta_eye),
-                           cy + radius*0.3 + eye_r*np.sin(theta_eye),
-                           np.ones_like(theta_eye)*z)).T
-
-    # Smile arc
-    offset = 3
-    theta_smile = np.linspace(np.pi/6, 5*np.pi/6, n_points//2)
-    smile_r = radius*0.5
-    smile = np.vstack((cx + smile_r*np.cos(theta_smile),
-                       cy - radius*0.2 + smile_r*np.sin(theta_smile) - offset,
-                       np.ones_like(theta_smile)*z)).T
-
-    return left_eye, right_eye, smile
-
+def generate_digit_sequences():
+    patterns = [digit_pattern(d, z=10, scale=1.0, offset=(0,0)) for d in range(1,6)]
+    trajectories = []
+    for i in range(10):
+        traj = []
+        for pat in patterns:
+            traj.append(pat[i])
+        trajectories.append(np.array(traj))
+    return trajectories
 
 # --- Drone class ---
 class Drone:
@@ -44,17 +56,19 @@ class Drone:
         self.m = 1.0
         self.g = 9.81
         self.J = np.diag([0.02, 0.02, 0.04])
-        self.dt = 0.001
+        self.dt = 0.01  # larger dt for speed
 
         # Gains
-        self.Kp = 4.0
-        self.Kd = 5.0
-        self.K_R = 1000
+        self.Kp = 2.0
+        self.Kd = 3.0
+        self.K_R = 500
         self.K_w = 20
+        self.K_avoid = 2.0  # collision avoidance gain
+        self.safety_radius = 1.0
 
         # State
-        rand_x_pos = np.random.uniform(0, 10)
-        rand_y_pos = np.random.uniform(0, 10)
+        rand_x_pos = np.random.uniform(-5, 5)
+        rand_y_pos = np.random.uniform(-5, 5)
         self.p = np.array([[rand_x_pos],[rand_y_pos],[0]])   # position
         self.v = np.zeros((3,1))
         self.R = np.eye(3)
@@ -62,8 +76,8 @@ class Drone:
 
         # Trajectory
         self.trajectory = trajectory
-        self.trajIndex = 0
-        self.nextPoint = self.trajectory[1,:].reshape(3,1)
+        self.stage = 0
+        self.nextPoint = self.trajectory[self.stage,:].reshape(3,1)
 
         # History
         self.posHistory = []
@@ -71,19 +85,31 @@ class Drone:
         # Visualization
         self.color = color
         self.line = None
-        self.ref_line = None
+        self.marker = None
 
-    def step(self):
+    def step(self, others):
         dt, m, g, J = self.dt, self.m, self.g, self.J
 
         # --- Outer loop PID ---
         p_des = self.nextPoint
-        a_cmd = self.Kp*(p_des - self.p) - self.Kd*self.v
-        a_cmd[2] += g
+
+        # Avoidance term
+        a_avoid = np.zeros((3,1))
+        for other in others:
+            if other is self: 
+                continue
+            diff = self.p - other.p
+            dist = np.linalg.norm(diff)
+            if dist < self.safety_radius and dist > 1e-3:
+                a_avoid += self.K_avoid * diff / (dist**2)
+
+        a_cmd = self.Kp*(p_des - self.p) - self.Kd*self.v + a_avoid
+        a_cmd[2] += g  # gravity compensation
 
         # --- Desired orientation ---
         f_des = m*a_cmd
         T = np.linalg.norm(f_des)
+        if T < 1e-6: T = 1e-6
         b3_des = f_des / T
         psi_des = 0.0
         b1_psi = np.array([[np.cos(psi_des)], [np.sin(psi_des)], [0]])
@@ -109,32 +135,23 @@ class Drone:
         # History
         self.posHistory.append(self.p.flatten())
 
-        # Waypoint switching
-        if np.linalg.norm(self.p - self.nextPoint) < 0.5:
-            if self.trajIndex < self.trajectory.shape[0]-2:
-                self.trajIndex += 1
-                self.nextPoint = self.trajectory[self.trajIndex+1,:].reshape(3,1)
+        # Waypoint switching (move to next digit after some time)
+        # Each digit lasts ~5s
+        if len(self.posHistory)*dt > (self.stage+1)*5 and self.stage < len(self.trajectory)-1:
+            self.stage += 1
+            self.nextPoint = self.trajectory[self.stage,:].reshape(3,1)
 
-def attack():
-    pass
-
-def smsf():
-    pass
-
+# --- Simulation ---
 def simulation():
-    dt = 0.001
     Tsim = 30
-    N = round(Tsim/dt)
+    N = round(Tsim/0.01)
 
-    # --- Trajectories ---
-    left_eye, right_eye, smile = smiley_parts(z=10, center=(5,5), radius=10)
+    # --- Generate digit sequences ---
+    trajectories = generate_digit_sequences()
 
-    # --- Create drones ---
-    drones = [
-        Drone(smile, color='g'),
-        Drone(left_eye, color='r'),
-        Drone(right_eye, color='m')
-    ]
+    # --- Create 10 drones ---
+    colors = plt.cm.tab10(np.linspace(0,1,10))
+    drones = [Drone(trajectories[i], color=colors[i]) for i in range(10)]
 
     # --- Setup plotting ---
     plt.ion()
@@ -142,48 +159,33 @@ def simulation():
     ax = fig.add_subplot(111, projection='3d')
 
     for drone in drones:
-        # Path trace
-        drone.line, = ax.plot([], [], [], drone.color, linewidth=1.0, label=f"Drone {drone.color}")
-        # Reference path
-        drone.ref_line, = ax.plot(drone.trajectory[:,0], drone.trajectory[:,1], drone.trajectory[:,2],
-                                  '--', color=drone.color, linewidth=0.8)
-        # Drone marker (point)
-        drone.marker, = ax.plot([], [], [], marker='o', color=drone.color, markersize=8)
+        drone.line, = ax.plot([], [], [], color=drone.color, linewidth=1.0)
+        drone.marker, = ax.plot([], [], [], marker='o', color=drone.color, markersize=6)
 
-    # Timer text overlay (upper left corner of 3D plot)
     timer_text = ax.text2D(0.05, 0.95, "Time: 0.0 s", transform=ax.transAxes, fontsize=12)
 
     ax.set_xlabel("X [m]"); ax.set_ylabel("Y [m]"); ax.set_zlabel("Z [m]")
-    ax.set_title("3 Drones Drawing Smiley Face")
-    # ax.legend()
+    ax.set_title("10 Drones Forming Numbers 1-5")
     ax.set_box_aspect([1,1,1])
 
     # --- Simulation loop ---
     for k in range(N):
         for drone in drones:
-            drone.step()
+            drone.step(drones)
 
-        # Update plots every 200 steps
-        if k % 200 == 0:
-            sim_time = k * dt
+        if k % 20 == 0:  # update plot
+            sim_time = k * drones[0].dt
             for drone in drones:
                 pos = np.array(drone.posHistory)
-                # Update trail
                 drone.line.set_data(pos[:,0], pos[:,1])
                 drone.line.set_3d_properties(pos[:,2])
-                # Update current drone marker
                 drone.marker.set_data([pos[-1,0]], [pos[-1,1]])
                 drone.marker.set_3d_properties([pos[-1,2]])
-
-            # Update timer
             timer_text.set_text(f"Time: {sim_time:.1f} s")
-
             plt.pause(0.001)
 
     plt.ioff()
     plt.show()
-
-
 
 if __name__ == "__main__":
     simulation()
