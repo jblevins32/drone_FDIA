@@ -1,3 +1,8 @@
+## To Run:
+- Execute `python3 main.py`
+- Simulation parameters can be changed in simulation() function
+
+## Notes:
 Should use time variant so the attack is not as obvious at beginning
 
 9/4
