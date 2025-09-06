@@ -201,14 +201,16 @@ def check_collisions(drones, use_obs=True, radius=0.00001):
 
 # --- Simulation ---
 def simulation():
-    Tsim = 25
-    N = round(Tsim/0.01)
-    trajectories = generate_digit_sequences()
-    num_drones = 1
 
+    # Simulation parameters
+    Tsim = 25
+    num_drones = 1
     attack_ctrl = True
     attack_obs = True
 
+    N = round(Tsim/0.01)
+    trajectories = generate_digit_sequences()
+    
     colors = plt.cm.tab10(np.linspace(0,1,10))
     drones = [Drone(trajectories[i], i, color=colors[i], attack_ctrl=attack_ctrl, attack_obs=attack_obs) for i in range(num_drones)]
     drones_nominal = [Drone(trajectories[i], i, color=colors[i], attack_ctrl=False, attack_obs=False) for i in range(num_drones)]
