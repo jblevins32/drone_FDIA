@@ -204,13 +204,14 @@ def simulation():
     Tsim = 25
     N = round(Tsim/0.01)
     trajectories = generate_digit_sequences()
+    num_drones = 1
 
     attack_ctrl = True
     attack_obs = True
 
     colors = plt.cm.tab10(np.linspace(0,1,10))
-    drones = [Drone(trajectories[i], i, color=colors[i], attack_ctrl=attack_ctrl, attack_obs=attack_obs) for i in range(10)]
-    drones_nominal = [Drone(trajectories[i], i, color=colors[i], attack_ctrl=False, attack_obs=False) for i in range(10)]
+    drones = [Drone(trajectories[i], i, color=colors[i], attack_ctrl=attack_ctrl, attack_obs=attack_obs) for i in range(num_drones)]
+    drones_nominal = [Drone(trajectories[i], i, color=colors[i], attack_ctrl=False, attack_obs=False) for i in range(num_drones)]
 
     plt.ion()
     fig = plt.figure(figsize=(24,6))
