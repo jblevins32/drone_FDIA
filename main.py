@@ -49,39 +49,33 @@ def generate_digit_sequences():
     return trajectories
 
 # --- Attack function ---
-def attack(u, ic, type='control'):
-    Su = 0.75
-    Sx = 1/Su
+def attack(var, ic, type='control'):
+    Su = np.diag([1.5, 1.5 , 1.0])
+    Sx = np.linalg.inv(Su)
     du = 0
-    dx = (ic * Sx) - ic
+    dx = ic - (Sx @ ic)
     if type == 'obs':
-        return (u * Sx) + dx
+        return (Sx @ var) + dx
     elif type == 'control':
-        return (u * Su) + du
+        return (Su @ var) + du
 
 # --- Drone class ---
 class Drone:
     def __init__(self, trajectory, idx, color='b', attack_ctrl=False, attack_obs=False):
-        '''
-        obs variables are those that are attacked with an observation attack. 
-        If no obs, it is what the drone is actually doing.
-        '''
         self.m = 1.0
         self.g = 9.81
         self.J = np.diag([0.02, 0.02, 0.04])
         self.dt = 0.01
 
         self.Kp = 5
-        self.Kd = 4.0
-        self.Ki = 1
+        self.Kd = 3.0
+        self.Ki = 0
         self.K_R = 500
-        self.K_w = 20
-        self.K_avoid = 10   # avoidance gain
+        self.K_w = 10
+        self.K_avoid = 0
         self.safety_radius = 1.0
         self.integral_error = np.zeros((3,1))
 
-        # rand_x_pos = np.random.uniform(-5, 5)
-        # rand_y_pos = np.random.uniform(-5, 5)
         x_pos = idx * 1 + 0.25
         y_pos = idx * 1 + 0.25
         self.p = np.array([[x_pos],[y_pos],[0]])
@@ -97,12 +91,11 @@ class Drone:
         self.stage = 0
         self.nextPoint = self.trajectory[self.stage,:].reshape(3,1)
 
-        self.posHistory_obs = []
-        self.errHistory_obs = []           
-        self.errHistory_pre_obs_attack = [] 
+        # histories
+        self.posHistory = []       # actual position history
+        self.posHistory_obs = []   # observed position history
 
         self.color = color
-
         self.attack_ctrl = attack_ctrl
         self.attack_obs = attack_obs
 
@@ -110,25 +103,23 @@ class Drone:
         dt, m, g, J = self.dt, self.m, self.g, self.J
         p_des = self.nextPoint
 
-        # --- Avoidance ---
+        # Avoidance (kept; set K_avoid>0 to use)
         a_avoid = np.zeros((3,1))
         for other in others:
-            if other is self:
-                continue
+            if other is self: continue
             diff = self.p_obs - other.p_obs
             dist = np.linalg.norm(diff)
             if dist < self.safety_radius and dist > 1e-3:
                 a_avoid += self.K_avoid * diff / (dist**2)
 
-        # --- Outer loop (controller acts on obs state) ---
+        # Outer loop (on obs state)
         self.integral_error += (p_des - self.p_obs) * dt
         a_cmd = self.Kp*(p_des - self.p_obs) - self.Kd*self.v_obs + self.Ki*self.integral_error + a_avoid
-        a_cmd[2] += g
-
         if self.attack_ctrl:
             a_cmd = attack(a_cmd, ic=self.p_ic, type='control')
 
-        # --- Orientation ---
+        # Orientation + dynamics
+        a_cmd[2] += g
         f_des = m*a_cmd
         T = np.linalg.norm(f_des)
         if T < 1e-6: T = 1e-6
@@ -136,21 +127,18 @@ class Drone:
         psi_des = 0.0
         b1_psi = np.array([[np.cos(psi_des)], [np.sin(psi_des)], [0]])
         b2_des = np.cross(b3_des.flatten(), b1_psi.flatten())
-        norm_b2 = np.linalg.norm(b2_des)
-        if norm_b2 < 1e-6:
+        if np.linalg.norm(b2_des) < 1e-6:
             b2_des = np.array([0,1,0])
         else:
-            b2_des /= norm_b2
+            b2_des /= np.linalg.norm(b2_des)
         b1_des = np.cross(b2_des, b3_des.flatten())
         R_des = np.column_stack((b1_des, b2_des, b3_des.flatten()))
 
-        # --- Inner loop ---
         e_R_mat = 0.5*(R_des.T @ self.R - self.R.T @ R_des)
         e_R = np.array([[e_R_mat[2,1]], [e_R_mat[0,2]], [e_R_mat[1,0]]])
-        tau = -self.K_R*e_R - self.K_w*self.omega + \
-              np.cross(self.omega.flatten(), (J @ self.omega).flatten()).reshape(3,1)
+        tau = -self.K_R*e_R - self.K_w*self.omega + np.cross(self.omega.flatten(), (J @ self.omega).flatten()).reshape(3,1)
 
-        omega_dot = np.linalg.inv(J) @ (tau - np.cross(self.omega.flatten(), (J @ self.omega).flatten()).reshape(3,1))
+        omega_dot = np.linalg.inv(self.J) @ (tau - np.cross(self.omega.flatten(), (self.J @ self.omega).flatten()).reshape(3,1))
         self.omega += omega_dot*dt
         if np.linalg.norm(self.omega) > 50:
             self.omega = 50 * self.omega / np.linalg.norm(self.omega)
@@ -162,34 +150,32 @@ class Drone:
         u, _, vh = np.linalg.svd(self.R)
         self.R = u @ vh
 
-        acc = np.array([[0],[0],[-g]]) + (T/m)*self.R[:,2].reshape(3,1)
+        acc = np.array([[0],[0],[-self.g]]) + (T/self.m)*self.R[:,2].reshape(3,1)
         self.v += acc*dt
         self.p += self.v*dt
 
-        # --- Pre-attack error ---
-        err_pre_obs_attack = np.linalg.norm(p_des - self.p)
-        self.errHistory_pre_obs_attack.append(err_pre_obs_attack)
+        # store actual position
+        self.posHistory.append(self.p.flatten())
 
-        # --- Observation attack ---
+        # Observation attack
         if self.attack_obs:
             self.p_obs = attack(self.p, ic=self.p_ic, type='obs')
             self.v_obs = attack(self.v, ic=self.v_ic, type='obs')
-        else: 
+        else:
             self.p_obs = self.p
             self.v_obs = self.v
 
-        # --- Post-attack error ---
+        # store observed position
         self.posHistory_obs.append(self.p_obs.flatten())
-        self.errHistory_obs.append(np.linalg.norm(p_des - self.p_obs))
 
-        # --- Waypoint switching ---
+        # stage change
         time_in_stage = len(self.posHistory_obs)*dt - self.stage*5
         if time_in_stage >= 5.0 and self.stage < len(self.trajectory)-1:
             self.stage += 1
             self.nextPoint = self.trajectory[self.stage,:].reshape(3,1)
 
 # --- Collision checking ---
-def check_collisions(drones, use_obs=True, radius=0.00001):
+def check_collisions(drones, use_obs=True, radius=0.5):
     count = 0
     for i in range(len(drones)):
         for j in range(i+1, len(drones)):
@@ -201,101 +187,166 @@ def check_collisions(drones, use_obs=True, radius=0.00001):
 
 # --- Simulation ---
 def simulation():
-
-    # Simulation parameters
     Tsim = 25
-    num_drones = 1
-    attack_ctrl = True
-    attack_obs = True
+    num_drones = 10
+    attack_ctrl, attack_obs = True, True
 
     N = round(Tsim/0.01)
     trajectories = generate_digit_sequences()
-    
-    colors = plt.cm.tab10(np.linspace(0,1,10))
+
+    colors = plt.cm.tab10(np.linspace(0,1,num_drones))
     drones = [Drone(trajectories[i], i, color=colors[i], attack_ctrl=attack_ctrl, attack_obs=attack_obs) for i in range(num_drones)]
     drones_nominal = [Drone(trajectories[i], i, color=colors[i], attack_ctrl=False, attack_obs=False) for i in range(num_drones)]
 
     plt.ion()
-    fig = plt.figure(figsize=(24,6))
-    ax_live_obs = fig.add_subplot(231, projection='3d')
-    ax_live_actual = fig.add_subplot(232, projection='3d')
-    ax_ref  = fig.add_subplot(233, projection='3d')
-    ax_err_obs  = fig.add_subplot(234)
-    ax_err_no_obs_attack = fig.add_subplot(235)
-    ax_err_nominal = fig.add_subplot(236)
+    fig = plt.figure(figsize=(24,16))  # taller to accommodate 4 rows
 
+    # Row 1: 3D animations
+    ax_live_obs     = fig.add_subplot(4,3,1, projection='3d')
+    ax_live_actual  = fig.add_subplot(4,3,2, projection='3d')
+    ax_ref          = fig.add_subplot(4,3,3, projection='3d')  # nominal positions/animation
+
+    # Row 2: Nominal positions vs time
+    ax_nom_x = fig.add_subplot(4,3,4)
+    ax_nom_y = fig.add_subplot(4,3,5)
+    ax_nom_z = fig.add_subplot(4,3,6)
+
+    # Row 3: Observed positions vs time
+    ax_obs_x = fig.add_subplot(4,3,7)
+    ax_obs_y = fig.add_subplot(4,3,8)
+    ax_obs_z = fig.add_subplot(4,3,9)
+
+    # Row 4: Actual positions vs time
+    ax_act_x = fig.add_subplot(4,3,10)
+    ax_act_y = fig.add_subplot(4,3,11)
+    ax_act_z = fig.add_subplot(4,3,12)
+
+    # Markers for top-row 3D plots
     for drone in drones:
-        drone.marker, = ax_live_obs.plot([], [], [], marker='o', color=drone.color, markersize=6)
-        drone.marker_actual, = ax_live_actual.plot([], [], [], marker='o', color=drone.color, markersize=6)
-        drone.ref_marker, = ax_ref.plot([], [], [], marker='x', color=drone.color, markersize=6)
-        drone.err_line, = ax_err_obs.plot([], [], color=drone.color)
-        drone.err_no_line, = ax_err_no_obs_attack.plot([], [], color=drone.color)
-    
+        drone.marker_obs_top,   = ax_live_obs.plot([], [], [], marker='o', color=drone.color, markersize=6)
+        drone.marker_actual_top,= ax_live_actual.plot([], [], [], marker='o', color=drone.color, markersize=6)
     for drone in drones_nominal:
-        drone.err_line, = ax_err_nominal.plot([], [], color=drone.color)
+        drone.marker_nominal_top, = ax_ref.plot([], [], [], marker='o', color=drone.color, markersize=6)
 
-    timer_text_obs = ax_live_obs.text2D(0.05, 0.95, "Time: 0.0 s | Collisions: 0", transform=ax_live_obs.transAxes, fontsize=12)
-    timer_text_actual = ax_live_actual.text2D(0.05, 0.95, "Time: 0.0 s | Collisions: 0", transform=ax_live_actual.transAxes, fontsize=12)
+    # Collision + stage text
+    text_obs = ax_live_obs.text2D(0.05, 0.95, "", transform=ax_live_obs.transAxes, fontsize=12)
+    text_act = ax_live_actual.text2D(0.05, 0.95, "", transform=ax_live_actual.transAxes, fontsize=12)
+    text_nom = ax_ref.text2D(0.05, 0.95, "", transform=ax_ref.transAxes, fontsize=12)
 
+    # Axis bounds for 3D plots
     traj_arr = np.array(trajectories)
-    extra_bound = 5
-    x_min, x_max = np.min(traj_arr[:,:,0])-extra_bound, np.max(traj_arr[:,:,0])+extra_bound
-    y_min, y_max = np.min(traj_arr[:,:,1])-extra_bound, np.max(traj_arr[:,:,1])+extra_bound
-    z_min, z_max = np.min(traj_arr[:,:,2])-extra_bound, np.max(traj_arr[:,:,2])+extra_bound
-    for ax in [ax_live_obs, ax_ref, ax_live_actual]:
+    extra = 5
+    x_min, x_max = np.min(traj_arr[:,:,0])-extra, np.max(traj_arr[:,:,0])+extra
+    y_min, y_max = np.min(traj_arr[:,:,1])-extra, np.max(traj_arr[:,:,1])+extra
+    z_min, z_max = np.min(traj_arr[:,:,2])-extra, np.max(traj_arr[:,:,2])+extra
+    for ax in [ax_live_obs, ax_live_actual, ax_ref]:
         ax.set_xlim([x_min, x_max]); ax.set_ylim([y_min, y_max]); ax.set_zlim([z_min, z_max])
         ax.set_xlabel("X [m]"); ax.set_ylabel("Y [m]"); ax.set_zlabel("Z [m]")
 
-    ax_live_obs.set_title("Observed Drone Positions")
-    ax_live_actual.set_title("Actual Drone Positions")
-    ax_ref.set_title("Reference Positions")
-    ax_err_obs.set_title("Desired - obs")
-    ax_err_no_obs_attack.set_title("Desired - actual")
-    ax_err_nominal.set_title("Obs - nominal")
+    ax_live_obs.set_title("Observed Drone Animation")
+    ax_live_actual.set_title("Actual Drone Animation")
+    ax_ref.set_title("Nominal Drone Animation")
 
-    collisions_obs = 0
-    collisions_actual = 0
+    # Time-series lines
+    nom_x_lines, nom_y_lines, nom_z_lines = [], [], []
+    obs_x_lines, obs_y_lines, obs_z_lines = [], [], []
+    act_x_lines, act_y_lines, act_z_lines = [], [], []
 
+    col_obs_total = 0
+    col_act_total = 0
+    col_nom_total = 0
+
+    for i in range(num_drones):
+        c = colors[i]
+        nom_x_lines.append(ax_nom_x.plot([], [], color=c)[0])
+        nom_y_lines.append(ax_nom_y.plot([], [], color=c)[0])
+        nom_z_lines.append(ax_nom_z.plot([], [], color=c)[0])
+        obs_x_lines.append(ax_obs_x.plot([], [], color=c)[0])
+        obs_y_lines.append(ax_obs_y.plot([], [], color=c)[0])
+        obs_z_lines.append(ax_obs_z.plot([], [], color=c)[0])
+        act_x_lines.append(ax_act_x.plot([], [], color=c)[0])
+        act_y_lines.append(ax_act_y.plot([], [], color=c)[0])
+        act_z_lines.append(ax_act_z.plot([], [], color=c)[0])
+
+    # Labels
+    for ax, lab in zip([ax_nom_x, ax_nom_y, ax_nom_z], ['X [m]', 'Y [m]', 'Z [m]']):
+        ax.set_title(f"Nominal {lab.split()[0]}"); ax.set_ylabel(lab)
+    for ax, lab in zip([ax_obs_x, ax_obs_y, ax_obs_z], ['X [m]', 'Y [m]', 'Z [m]']):
+        ax.set_title(f"Observed {lab.split()[0]}"); ax.set_ylabel(lab)
+    for ax, lab in zip([ax_act_x, ax_act_y, ax_act_z], ['X [m]', 'Y [m]', 'Z [m]']):
+        ax.set_title(f"Actual {lab.split()[0]}"); ax.set_ylabel(lab)
+
+    # Simulation loop
     for k in range(N):
-        for drone in drones:
-            drone.step(drones)
-        for drone in drones_nominal:
-            drone.step(drones_nominal)
-
-        collisions_obs += check_collisions(drones, use_obs=True, radius=1.0)
-        collisions_actual += check_collisions(drones, use_obs=False, radius=1.0)
+        for drone in drones: drone.step(drones)
+        for drone in drones_nominal: drone.step(drones_nominal)
 
         if k % 20 == 0:
+            t_obs = np.arange(len(drones[0].posHistory_obs)) * drones[0].dt
+            t_act = np.arange(len(drones[0].posHistory)) * drones[0].dt
+            t_nom = np.arange(len(drones_nominal[0].posHistory)) * drones_nominal[0].dt
+
+            # update 3D markers
+            for d in drones:
+                if d.posHistory_obs:
+                    p_obs = d.posHistory_obs[-1]
+                    d.marker_obs_top.set_data([p_obs[0]], [p_obs[1]])
+                    d.marker_obs_top.set_3d_properties([p_obs[2]])
+                if d.posHistory:
+                    p_act = d.posHistory[-1]
+                    d.marker_actual_top.set_data([p_act[0]], [p_act[1]])
+                    d.marker_actual_top.set_3d_properties([p_act[2]])
+            for dn in drones_nominal:
+                if dn.posHistory:
+                    p_nom = dn.posHistory[-1]
+                    dn.marker_nominal_top.set_data([p_nom[0]], [p_nom[1]])
+                    dn.marker_nominal_top.set_3d_properties([p_nom[2]])
+
+            # check collisions at this step
+            col_obs = check_collisions(drones, use_obs=True)
+            col_act = check_collisions(drones, use_obs=False)
+            col_nom = check_collisions(drones_nominal, use_obs=False)
+
+            # accumulate totals
+            col_obs_total += col_obs
+            col_act_total += col_act
+            col_nom_total += col_nom
+
+            # stage info
+            stage = drones[0].stage + 1
             sim_time = k * drones[0].dt
-            for drone in drones:
-                pos = np.array(drone.posHistory_obs)
-                drone.marker.set_data([pos[-1,0]], [pos[-1,1]])
-                drone.marker.set_3d_properties([pos[-1,2]])
-                drone.marker_actual.set_data([drone.p[0,0]], [drone.p[1,0]])
-                drone.marker_actual.set_3d_properties([drone.p[2,0]])
-                ref = drone.nextPoint.flatten()
-                drone.ref_marker.set_data([ref[0]], [ref[1]])
-                drone.ref_marker.set_3d_properties([ref[2]])
-                drone.err_line.set_data(np.arange(len(drone.errHistory_obs))*drone.dt, drone.errHistory_obs)
-                drone.err_no_line.set_data(np.arange(len(drone.errHistory_pre_obs_attack))*drone.dt, drone.errHistory_pre_obs_attack)
 
-            for i in range(len(drones)):
-                drone = drones[i]
-                drone_nominal = drones_nominal[i]
-                drone_nominal.err_line.set_data(
-                    np.arange(len(drone.errHistory_obs))*drone.dt,
-                    np.array(drone.errHistory_obs) - np.array(drone_nominal.errHistory_obs)
-                )
+            # update the texts
+            text_obs.set_text(f"t={sim_time:.1f}s | Collisions: {col_obs_total} | Stage: {stage}/5")
+            text_act.set_text(f"t={sim_time:.1f}s | Collisions: {col_act_total} | Stage: {stage}/5")
+            text_nom.set_text(f"t={sim_time:.1f}s | Collisions: {col_nom_total} | Stage: {stage}/5")
 
-            timer_text_obs.set_text(f"Time: {sim_time:.1f} s | Collisions: {collisions_obs}")
-            timer_text_actual.set_text(f"Time: {sim_time:.1f} s | Collisions: {collisions_actual}")
-            ax_err_obs.relim(); ax_err_obs.autoscale_view()
-            ax_err_no_obs_attack.relim(); ax_err_no_obs_attack.autoscale_view()
-            ax_err_nominal.relim(); ax_err_nominal.autoscale_view()
-            plt.pause(0.001)
+            # update time-series
+            for i in range(num_drones):
+                p_nom_hist = np.array(drones_nominal[i].posHistory)
+                if len(p_nom_hist) > 0:
+                    nom_x_lines[i].set_data(t_nom[:len(p_nom_hist)], p_nom_hist[:,0])
+                    nom_y_lines[i].set_data(t_nom[:len(p_nom_hist)], p_nom_hist[:,1])
+                    nom_z_lines[i].set_data(t_nom[:len(p_nom_hist)], p_nom_hist[:,2])
+                p_obs_hist = np.array(drones[i].posHistory_obs)
+                if len(p_obs_hist) > 0:
+                    obs_x_lines[i].set_data(t_obs[:len(p_obs_hist)], p_obs_hist[:,0])
+                    obs_y_lines[i].set_data(t_obs[:len(p_obs_hist)], p_obs_hist[:,1])
+                    obs_z_lines[i].set_data(t_obs[:len(p_obs_hist)], p_obs_hist[:,2])
+                p_act_hist = np.array(drones[i].posHistory)
+                if len(p_act_hist) > 0:
+                    act_x_lines[i].set_data(t_act[:len(p_act_hist)], p_act_hist[:,0])
+                    act_y_lines[i].set_data(t_act[:len(p_act_hist)], p_act_hist[:,1])
+                    act_z_lines[i].set_data(t_act[:len(p_act_hist)], p_act_hist[:,2])
 
-    plt.ioff()
-    plt.show()
+            for ax in [ax_nom_x, ax_nom_y, ax_nom_z,
+                       ax_obs_x, ax_obs_y, ax_obs_z,
+                       ax_act_x, ax_act_y, ax_act_z]:
+                ax.relim(); ax.autoscale_view()
+
+            plt.pause(0.0001)
+
+    plt.ioff(); plt.show()
 
 if __name__ == "__main__":
     simulation()
